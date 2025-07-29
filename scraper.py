@@ -90,12 +90,11 @@ class GovMyCrawler:
             with open(self.scraped_file, 'a') as f:
                 f.write(f"{domain}\n")
 
-    def _save_subdomain(self, subdomain, is_new_discovery=False):
-        """Save subdomain to the discovered domains file if it's a new discovery."""
-        if is_new_discovery:
-            with self.file_lock:
-                with open(self.discovered_file, 'a') as f:
-                    f.write(f"{subdomain} (subdomain)\n")
+    def _save_scraped_subdomain(self, subdomain):
+        """Append a scraped subdomain to the real-time file."""
+        with self.file_lock:
+            with open(self.scraped_file, 'a') as f:
+                f.write(f"{subdomain}\n")
 
     def _initialize_queue(self):
         """Reads the input file and populates the initial crawl queue."""
@@ -227,10 +226,9 @@ class GovMyCrawler:
             with self.subdomains_lock:
                 if domain not in self.all_subdomains:
                     self.all_subdomains.add(domain)
-                    # Check if this is a new subdomain discovery
+                    # Check if this is a new subdomain discovery (only log, don't save to discovered file)
                     if domain != top_level_domain:
                         print(f"🔍 Found new subdomain: {domain}")
-                        self._save_subdomain(domain, is_new_discovery=True)
             
             # Only add URL to queue if the subdomain hasn't been scraped yet and URL is new (thread-safe)
             with self.visited_lock:
@@ -293,6 +291,7 @@ class GovMyCrawler:
                         with self.subdomains_lock:
                             if current_domain and current_domain not in self.scraped_subdomains:
                                 self.scraped_subdomains.add(current_domain)
+                                self._save_scraped_subdomain(current_domain)
                                 print(f"   ✅ Marked subdomain {current_domain} as scraped")
                         
                         # Also mark the top-level domain as scraped if it's the same
