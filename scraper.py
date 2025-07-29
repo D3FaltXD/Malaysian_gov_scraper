@@ -25,8 +25,12 @@ class GovMyCrawler:
         self.seed_domains = set()
         # A set to store domains that were discovered during crawling (not from seed file)
         self.discovered_domains = set()
+        # A set to store domains that have been scraped to prevent re-scraping
+        self.scraped_domains = set()
         # File to save discovered domains in real-time
         self.discovered_file = "discovered_domains_realtime.txt"
+        # File to track scraped websites in real-time
+        self.scraped_file = "websites_scraped.txt"
         # Set a user-agent to mimic a real browser
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
@@ -45,6 +49,8 @@ class GovMyCrawler:
         
         # Initialize the discovered domains file
         self._initialize_discovered_file()
+        # Initialize the scraped domains file
+        self._initialize_scraped_file()
 
     def _initialize_discovered_file(self):
         """Initialize the real-time discovered domains file."""
@@ -52,9 +58,20 @@ class GovMyCrawler:
             f.write(f"# Newly discovered .gov.my domains (real-time)\n")
             f.write(f"# Started crawling on: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
+    def _initialize_scraped_file(self):
+        """Initialize the real-time scraped websites file."""
+        with open(self.scraped_file, 'w') as f:
+            f.write(f"# Scraped .gov.my domains (real-time)\n")
+            f.write(f"# Started crawling on: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
     def _save_discovered_domain(self, domain):
         """Append a newly discovered domain to the real-time file."""
         with open(self.discovered_file, 'a') as f:
+            f.write(f"{domain}\n")
+
+    def _save_scraped_domain(self, domain):
+        """Append a scraped domain to the real-time file."""
+        with open(self.scraped_file, 'a') as f:
             f.write(f"{domain}\n")
 
     def _initialize_queue(self):
@@ -136,8 +153,9 @@ class GovMyCrawler:
                             
                             self.found_domains.add(top_level_domain)
                         
-                        # If the URL is new and within scope, add it to our queue to crawl
-                        if absolute_url not in self.visited_urls:
+                        # Only add URL to queue if the domain hasn't been scraped yet and URL is new
+                        if (absolute_url not in self.visited_urls and 
+                            top_level_domain not in self.scraped_domains):
                             self.queue.append(absolute_url)
                             links_found += 1
             except Exception as e:
@@ -159,6 +177,22 @@ class GovMyCrawler:
             if current_url in self.visited_urls:
                 continue
 
+            # Extract domain from current URL to check if we've already scraped this domain
+            try:
+                parsed_url = urlparse(current_url)
+                current_domain = parsed_url.netloc
+                current_top_level_domain = self._extract_top_level_domain(current_domain)
+                
+                # Skip if we've already scraped this domain
+                if current_top_level_domain and current_top_level_domain in self.scraped_domains:
+                    print(f"⏭️  Skipping {current_url} - domain {current_top_level_domain} already scraped")
+                    self.visited_urls.add(current_url)
+                    continue
+                    
+            except Exception as e:
+                print(f"⚠️  Could not parse domain from {current_url}: {e}")
+                continue
+
             # Also mark the http/https counterpart as visited to avoid double-checking
             if current_url.startswith("http://"):
                 https_version = "https://" + current_url[7:]
@@ -178,6 +212,12 @@ class GovMyCrawler:
                 if response.status_code == 200:
                     content_type = response.headers.get('Content-Type', '').lower()
                     if 'text/html' in content_type:
+                        # Mark this domain as scraped
+                        if current_top_level_domain and current_top_level_domain not in self.scraped_domains:
+                            self.scraped_domains.add(current_top_level_domain)
+                            self._save_scraped_domain(current_top_level_domain)
+                            print(f"   ✅ Marked {current_top_level_domain} as scraped")
+                        
                         soup = BeautifulSoup(response.content, 'html.parser')
                         links_found = self._extract_links(current_url, soup)
                         print(f"   -> Found {links_found} new links to crawl")
@@ -222,9 +262,11 @@ class GovMyCrawler:
         print(f"\nFound {len(self.found_domains)} unique top-level .gov.my domains.")
         print(f"Seed domains from input file: {len(self.seed_domains)}")
         print(f"Newly discovered domains during crawling: {len(self.discovered_domains)}")
+        print(f"Domains actually scraped: {len(self.scraped_domains)}")
         print(f"Crawled {len(self.visited_urls)} total URLs.")
         print(f"💾 Saving all top-level domains to {output_file}...")
         print(f"💾 Newly discovered domains were saved in real-time to {self.discovered_file}")
+        print(f"💾 Scraped domains were tracked in real-time in {self.scraped_file}")
         
         sorted_domains = sorted(list(self.found_domains))
         
@@ -233,6 +275,7 @@ class GovMyCrawler:
             f.write(f"# Total domains: {len(sorted_domains)}\n")
             f.write(f"# Seed domains: {len(self.seed_domains)}\n")
             f.write(f"# Newly discovered during crawling: {len(self.discovered_domains)}\n")
+            f.write(f"# Domains actually scraped: {len(self.scraped_domains)}\n")
             f.write(f"# Crawled URLs: {len(self.visited_urls)}\n")
             f.write(f"# Generated on: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             for domain in sorted_domains:
@@ -243,6 +286,12 @@ class GovMyCrawler:
             f.write(f"\n# Crawling completed on: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"# Total newly discovered domains: {len(self.discovered_domains)}\n")
             f.write(f"# Seed domains from input file: {len(self.seed_domains)}\n")
+        
+        # Update the scraped domains file with final stats
+        with open(self.scraped_file, 'a') as f:
+            f.write(f"\n# Crawling completed on: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"# Total domains scraped: {len(self.scraped_domains)}\n")
+            f.write(f"# Total URLs crawled: {len(self.visited_urls)}\n")
         
         print("✅ Done.")
 
