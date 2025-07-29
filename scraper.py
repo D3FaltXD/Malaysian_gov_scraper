@@ -29,6 +29,10 @@ class GovMyCrawler:
         self.discovered_domains = set()
         # A set to store domains that have been scraped to prevent re-scraping
         self.scraped_domains = set()
+        # A set to store all subdomains found (including top-level domains)
+        self.all_subdomains = set()
+        # A set to store scraped subdomains to prevent re-scraping
+        self.scraped_subdomains = set()
         # File to save discovered domains in real-time
         self.discovered_file = "discovered_domains_realtime.txt"
         # File to track scraped websites in real-time
@@ -38,6 +42,7 @@ class GovMyCrawler:
         self.visited_lock = threading.Lock()
         self.found_domains_lock = threading.Lock()
         self.scraped_domains_lock = threading.Lock()
+        self.subdomains_lock = threading.Lock()
         self.file_lock = threading.Lock()
         # Set a user-agent to mimic a real browser
         self.headers = {
@@ -63,13 +68,14 @@ class GovMyCrawler:
     def _initialize_discovered_file(self):
         """Initialize the real-time discovered domains file."""
         with open(self.discovered_file, 'w') as f:
-            f.write(f"# Newly discovered .gov.my domains (real-time)\n")
+            f.write(f"# Newly discovered .gov.my domains and subdomains (real-time)\n")
+            f.write(f"# Includes domains from links and email addresses\n")
             f.write(f"# Started crawling on: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
     def _initialize_scraped_file(self):
         """Initialize the real-time scraped websites file."""
         with open(self.scraped_file, 'w') as f:
-            f.write(f"# Scraped .gov.my domains (real-time)\n")
+            f.write(f"# Scraped .gov.my domains and subdomains (real-time)\n")
             f.write(f"# Started crawling on: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
     def _save_discovered_domain(self, domain):
@@ -84,6 +90,13 @@ class GovMyCrawler:
             with open(self.scraped_file, 'a') as f:
                 f.write(f"{domain}\n")
 
+    def _save_subdomain(self, subdomain, is_new_discovery=False):
+        """Save subdomain to the discovered domains file if it's a new discovery."""
+        if is_new_discovery:
+            with self.file_lock:
+                with open(self.discovered_file, 'a') as f:
+                    f.write(f"{subdomain} (subdomain)\n")
+
     def _initialize_queue(self):
         """Reads the input file and populates the initial crawl queue."""
         if not os.path.exists(self.input_file):
@@ -94,7 +107,7 @@ class GovMyCrawler:
         print(f"📖 Reading seed domains from '{self.input_file}'...")
         with open(self.input_file, 'r') as f:
             for line in f:
-                domain = line.strip()
+                domain = line.strip().lower()  # Convert to lowercase
                 if domain:
                     # Extract top-level domain to avoid duplicates from subdomains
                     top_level = self._extract_top_level_domain(domain)
@@ -118,7 +131,13 @@ class GovMyCrawler:
         Extracts the top-level domain from a potentially subdomain.
         Example: subdomain.example.gov.my -> example.gov.my
         """
-        if not domain or not domain.endswith('.gov.my'):
+        if not domain:
+            return None
+        
+        # Convert to lowercase for consistency
+        domain = domain.lower()
+        
+        if not domain.endswith('.gov.my'):
             return None
             
         # Split the domain into parts
@@ -148,8 +167,10 @@ class GovMyCrawler:
         return session
     
     def _extract_links(self, current_url, soup):
-        """Extracts top-level domains from all links on a page and adds them to the queue."""
+        """Extracts top-level domains and subdomains from all links and emails on a page and adds them to the queue."""
         links_found = 0
+        
+        # Extract domains from regular links
         for link in soup.find_all('a', href=True):
             href = link['href']
             # Create an absolute URL from a relative one (e.g., /contact-us)
@@ -157,40 +178,70 @@ class GovMyCrawler:
             
             try:
                 parsed_url = urlparse(absolute_url)
-                domain = parsed_url.netloc
+                domain = parsed_url.netloc.lower()  # Convert to lowercase
 
                 # We are only interested in .gov.my domains
                 if domain and domain.endswith('.gov.my'):
-                    # Extract top-level domain (remove subdomains)
-                    top_level_domain = self._extract_top_level_domain(domain)
-                    
-                    if top_level_domain:
-                        # Add the top-level domain to our set of findings (thread-safe)
-                        with self.found_domains_lock:
-                            if top_level_domain not in self.found_domains:
-                                # Check if this is a truly new discovery (not in seed file)
-                                if top_level_domain not in self.seed_domains:
-                                    print(f"✅ Found new top-level domain: {top_level_domain}")
-                                    # Save to discovered domains set and file
-                                    self.discovered_domains.add(top_level_domain)
-                                    self._save_discovered_domain(top_level_domain)
-                                else:
-                                    print(f"🔄 Found seed domain during crawl: {top_level_domain}")
-                                
-                                self.found_domains.add(top_level_domain)
-                        
-                        # Only add URL to queue if the domain hasn't been scraped yet and URL is new (thread-safe)
-                        with self.visited_lock:
-                            with self.scraped_domains_lock:
-                                if (absolute_url not in self.visited_urls and 
-                                    top_level_domain not in self.scraped_domains):
-                                    with self.queue_lock:
-                                        self.queue.append(absolute_url)
-                                        links_found += 1
+                    links_found += self._process_domain(domain, absolute_url)
             except Exception as e:
                 print(f"⚠️  Could not parse URL {absolute_url}: {e}")
         
+        # Extract domains from email addresses
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b'
+        page_text = soup.get_text()
+        email_matches = re.findall(email_pattern, page_text)
+        
+        for email_domain in email_matches:
+            email_domain = email_domain.lower()  # Convert to lowercase
+            if email_domain.endswith('.gov.my'):
+                # Create a dummy URL for the email domain to add to queue
+                dummy_url = f"https://{email_domain}"
+                links_found += self._process_domain(email_domain, dummy_url)
+                print(f"📧 Found email domain: {email_domain}")
+        
         return links_found
+
+    def _process_domain(self, domain, url):
+        """Process a discovered domain and add it to appropriate sets and queue."""
+        links_added = 0
+        
+        # Extract top-level domain (remove subdomains)
+        top_level_domain = self._extract_top_level_domain(domain)
+        
+        if top_level_domain:
+            # Handle top-level domain discovery (thread-safe)
+            with self.found_domains_lock:
+                if top_level_domain not in self.found_domains:
+                    # Check if this is a truly new discovery (not in seed file)
+                    if top_level_domain not in self.seed_domains:
+                        print(f"✅ Found new top-level domain: {top_level_domain}")
+                        # Save to discovered domains set and file
+                        self.discovered_domains.add(top_level_domain)
+                        self._save_discovered_domain(top_level_domain)
+                    else:
+                        print(f"🔄 Found seed domain during crawl: {top_level_domain}")
+                    
+                    self.found_domains.add(top_level_domain)
+            
+            # Handle subdomain discovery (thread-safe)
+            with self.subdomains_lock:
+                if domain not in self.all_subdomains:
+                    self.all_subdomains.add(domain)
+                    # Check if this is a new subdomain discovery
+                    if domain != top_level_domain:
+                        print(f"🔍 Found new subdomain: {domain}")
+                        self._save_subdomain(domain, is_new_discovery=True)
+            
+            # Only add URL to queue if the subdomain hasn't been scraped yet and URL is new (thread-safe)
+            with self.visited_lock:
+                with self.subdomains_lock:
+                    if (url not in self.visited_urls and 
+                        domain not in self.scraped_subdomains):
+                        with self.queue_lock:
+                            self.queue.append(url)
+                            links_added = 1
+        
+        return links_added
 
     def _crawl_single_url(self, current_url):
         """Crawl a single URL - designed to be run in a thread."""
@@ -217,13 +268,13 @@ class GovMyCrawler:
             # Extract domain from current URL
             try:
                 parsed_url = urlparse(current_url)
-                current_domain = parsed_url.netloc
+                current_domain = parsed_url.netloc.lower()  # Convert to lowercase
                 current_top_level_domain = self._extract_top_level_domain(current_domain)
                 
-                # Skip if we've already scraped this domain (thread-safe)
-                with self.scraped_domains_lock:
-                    if current_top_level_domain and current_top_level_domain in self.scraped_domains:
-                        print(f"⏭️  Skipping {current_url} - domain {current_top_level_domain} already scraped")
+                # Skip if we've already scraped this specific subdomain (thread-safe)
+                with self.subdomains_lock:
+                    if current_domain and current_domain in self.scraped_subdomains:
+                        print(f"⏭️  Skipping {current_url} - subdomain {current_domain} already scraped")
                         return None
                         
             except Exception as e:
@@ -238,12 +289,20 @@ class GovMyCrawler:
                 if response.status_code == 200:
                     content_type = response.headers.get('Content-Type', '').lower()
                     if 'text/html' in content_type:
-                        # Mark this domain as scraped (thread-safe)
+                        # Mark this subdomain as scraped (thread-safe)
+                        with self.subdomains_lock:
+                            if current_domain and current_domain not in self.scraped_subdomains:
+                                self.scraped_subdomains.add(current_domain)
+                                print(f"   ✅ Marked subdomain {current_domain} as scraped")
+                        
+                        # Also mark the top-level domain as scraped if it's the same
                         with self.scraped_domains_lock:
-                            if current_top_level_domain and current_top_level_domain not in self.scraped_domains:
+                            if (current_top_level_domain and 
+                                current_domain == current_top_level_domain and 
+                                current_top_level_domain not in self.scraped_domains):
                                 self.scraped_domains.add(current_top_level_domain)
                                 self._save_scraped_domain(current_top_level_domain)
-                                print(f"   ✅ Marked {current_top_level_domain} as scraped")
+                                print(f"   ✅ Marked top-level domain {current_top_level_domain} as scraped")
                         
                         soup = BeautifulSoup(response.content, 'html.parser')
                         links_found = self._extract_links(current_url, soup)
@@ -330,40 +389,66 @@ class GovMyCrawler:
             self.session.close()
 
     def save_results(self):
-        """Saves the found top-level domains to a text file."""
+        """Saves the found top-level domains and subdomains to text files."""
         output_file = "gov_my_top_level_domains.txt"
+        subdomains_file = "gov_my_all_subdomains.txt"
+        
         print(f"\nFound {len(self.found_domains)} unique top-level .gov.my domains.")
+        print(f"Found {len(self.all_subdomains)} total subdomains (including top-level).")
         print(f"Seed domains from input file: {len(self.seed_domains)}")
         print(f"Newly discovered domains during crawling: {len(self.discovered_domains)}")
-        print(f"Domains actually scraped: {len(self.scraped_domains)}")
+        print(f"Top-level domains actually scraped: {len(self.scraped_domains)}")
+        print(f"Subdomains actually scraped: {len(self.scraped_subdomains)}")
         print(f"Crawled {len(self.visited_urls)} total URLs.")
         print(f"💾 Saving all top-level domains to {output_file}...")
+        print(f"💾 Saving all subdomains to {subdomains_file}...")
         print(f"💾 Newly discovered domains were saved in real-time to {self.discovered_file}")
         print(f"💾 Scraped domains were tracked in real-time in {self.scraped_file}")
         
         sorted_domains = sorted(list(self.found_domains))
+        sorted_subdomains = sorted(list(self.all_subdomains))
         
+        # Save top-level domains
         with open(output_file, 'w') as f:
             f.write(f"# Top-level .gov.my domains found by crawler\n")
-            f.write(f"# Total domains: {len(sorted_domains)}\n")
+            f.write(f"# Total top-level domains: {len(sorted_domains)}\n")
+            f.write(f"# Total subdomains found: {len(sorted_subdomains)}\n")
             f.write(f"# Seed domains: {len(self.seed_domains)}\n")
             f.write(f"# Newly discovered during crawling: {len(self.discovered_domains)}\n")
-            f.write(f"# Domains actually scraped: {len(self.scraped_domains)}\n")
+            f.write(f"# Top-level domains actually scraped: {len(self.scraped_domains)}\n")
+            f.write(f"# Subdomains actually scraped: {len(self.scraped_subdomains)}\n")
             f.write(f"# Crawled URLs: {len(self.visited_urls)}\n")
             f.write(f"# Generated on: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             for domain in sorted_domains:
                 f.write(domain + '\n')
         
+        # Save all subdomains (including top-level domains)
+        with open(subdomains_file, 'w') as f:
+            f.write(f"# All .gov.my domains and subdomains found by crawler\n")
+            f.write(f"# Total entries: {len(sorted_subdomains)}\n")
+            f.write(f"# Top-level domains: {len(sorted_domains)}\n")
+            f.write(f"# Subdomains scraped: {len(self.scraped_subdomains)}\n")
+            f.write(f"# Generated on: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            for subdomain in sorted_subdomains:
+                # Mark if it's a top-level domain or subdomain
+                top_level = self._extract_top_level_domain(subdomain)
+                if subdomain == top_level:
+                    f.write(f"{subdomain} (top-level)\n")
+                else:
+                    f.write(f"{subdomain} (subdomain of {top_level})\n")
+        
         # Update the discovered domains file with final stats
         with open(self.discovered_file, 'a') as f:
             f.write(f"\n# Crawling completed on: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"# Total newly discovered domains: {len(self.discovered_domains)}\n")
+            f.write(f"# Total newly discovered top-level domains: {len(self.discovered_domains)}\n")
+            f.write(f"# Total subdomains found: {len(self.all_subdomains)}\n")
             f.write(f"# Seed domains from input file: {len(self.seed_domains)}\n")
         
         # Update the scraped domains file with final stats
         with open(self.scraped_file, 'a') as f:
             f.write(f"\n# Crawling completed on: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"# Total domains scraped: {len(self.scraped_domains)}\n")
+            f.write(f"# Total top-level domains scraped: {len(self.scraped_domains)}\n")
+            f.write(f"# Total subdomains scraped: {len(self.scraped_subdomains)}\n")
             f.write(f"# Total URLs crawled: {len(self.visited_urls)}\n")
         
         print("✅ Done.")
