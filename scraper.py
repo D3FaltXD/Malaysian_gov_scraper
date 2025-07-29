@@ -17,8 +17,8 @@ class GovMyCrawler:
     """
     def __init__(self, input_file):
         self.input_file = input_file
-        # A double-ended queue for URLs to visit
-        self.queue = collections.deque()
+        # A stack (list) for URLs to visit - LIFO for better efficiency
+        self.stack = []
         # A set to store URLs we have already visited to prevent re-crawling
         self.visited_urls = set()
         # A set to store the unique .gov.my domains we find
@@ -38,7 +38,7 @@ class GovMyCrawler:
         # File to track scraped websites in real-time
         self.scraped_file = "websites_scraped.txt"
         # Thread locks for thread-safe operations
-        self.queue_lock = threading.Lock()
+        self.stack_lock = threading.Lock()
         self.visited_lock = threading.Lock()
         self.found_domains_lock = threading.Lock()
         self.scraped_domains_lock = threading.Lock()
@@ -90,14 +90,14 @@ class GovMyCrawler:
             with open(self.scraped_file, 'a') as f:
                 f.write(f"{domain}\n")
 
-    def _save_scraped_subdomain(self, subdomain):
-        """Append a scraped subdomain to the real-time file."""
-        with self.file_lock:
-            with open(self.scraped_file, 'a') as f:
-                f.write(f"{subdomain}\n")
+    def _should_skip_domain(self, domain):
+        """Check if a domain should be skipped (e.g., www subdomains)."""
+        if domain.startswith('www.'):
+            return True
+        return False
 
     def _initialize_queue(self):
-        """Reads the input file and populates the initial crawl queue."""
+        """Reads the input file and populates the initial crawl stack."""
         if not os.path.exists(self.input_file):
             print(f"❌ Error: Input file '{self.input_file}' not found.")
             print("Please create this file and populate it with your list of domains.")
@@ -114,15 +114,15 @@ class GovMyCrawler:
                         # Add to seed domains set
                         self.seed_domains.add(top_level)
                         # Add both http and https versions to be safe
-                        self.queue.append(f"http://{domain}")
-                        self.queue.append(f"https://{domain}")
+                        self.stack.append(f"http://{domain}")
+                        self.stack.append(f"https://{domain}")
                         self.found_domains.add(top_level) # Add the top-level domain
         
-        if not self.queue:
+        if not self.stack:
             print("⚠️  Warning: No domains found in the input file.")
             return False
             
-        print(f"✅ Initialized queue with {len(self.queue)} URLs from {len(self.seed_domains)} seed domains.")
+        print(f"✅ Initialized stack with {len(self.stack)} URLs from {len(self.seed_domains)} seed domains.")
         return True
 
     def _extract_top_level_domain(self, domain):
@@ -180,7 +180,7 @@ class GovMyCrawler:
                 domain = parsed_url.netloc.lower()  # Convert to lowercase
 
                 # We are only interested in .gov.my domains
-                if domain and domain.endswith('.gov.my'):
+                if domain and domain.endswith('.gov.my') and not self._should_skip_domain(domain):
                     links_found += self._process_domain(domain, absolute_url)
             except Exception as e:
                 print(f"⚠️  Could not parse URL {absolute_url}: {e}")
@@ -192,7 +192,7 @@ class GovMyCrawler:
         
         for email_domain in email_matches:
             email_domain = email_domain.lower()  # Convert to lowercase
-            if email_domain.endswith('.gov.my'):
+            if email_domain.endswith('.gov.my') and not self._should_skip_domain(email_domain):
                 # Create a dummy URL for the email domain to add to queue
                 dummy_url = f"https://{email_domain}"
                 links_found += self._process_domain(email_domain, dummy_url)
@@ -230,13 +230,13 @@ class GovMyCrawler:
                     if domain != top_level_domain:
                         print(f"🔍 Found new subdomain: {domain}")
             
-            # Only add URL to queue if the subdomain hasn't been scraped yet and URL is new (thread-safe)
+            # Only add URL to stack if the subdomain hasn't been scraped yet and URL is new (thread-safe)
             with self.visited_lock:
                 with self.subdomains_lock:
                     if (url not in self.visited_urls and 
                         domain not in self.scraped_subdomains):
-                        with self.queue_lock:
-                            self.queue.append(url)
+                        with self.stack_lock:
+                            self.stack.append(url)  # LIFO - add to end, pop from end
                             links_added = 1
         
         return links_added
@@ -269,7 +269,11 @@ class GovMyCrawler:
                 current_domain = parsed_url.netloc.lower()  # Convert to lowercase
                 current_top_level_domain = self._extract_top_level_domain(current_domain)
                 
-                # Skip if we've already scraped this specific subdomain (thread-safe)
+                # Skip if this is a www domain or already scraped subdomain (thread-safe)
+                if self._should_skip_domain(current_domain):
+                    print(f"⏭️  Skipping {current_url} - www subdomain filtered out")
+                    return None
+                    
                 with self.subdomains_lock:
                     if current_domain and current_domain in self.scraped_subdomains:
                         print(f"⏭️  Skipping {current_url} - subdomain {current_domain} already scraped")
@@ -287,21 +291,25 @@ class GovMyCrawler:
                 if response.status_code == 200:
                     content_type = response.headers.get('Content-Type', '').lower()
                     if 'text/html' in content_type:
-                        # Mark this subdomain as scraped (thread-safe)
+                        # Check if this is a top-level domain or subdomain
+                        is_top_level = (current_domain == current_top_level_domain)
+                        
+                        # Mark domain as scraped (thread-safe)
                         with self.subdomains_lock:
                             if current_domain and current_domain not in self.scraped_subdomains:
                                 self.scraped_subdomains.add(current_domain)
-                                self._save_scraped_subdomain(current_domain)
-                                print(f"   ✅ Marked subdomain {current_domain} as scraped")
+                                self._save_scraped_domain(current_domain)
+                                
+                                if is_top_level:
+                                    print(f"   ✅ Marked top-level domain {current_domain} as scraped")
+                                else:
+                                    print(f"   ✅ Marked subdomain {current_domain} as scraped")
                         
-                        # Also mark the top-level domain as scraped if it's the same
-                        with self.scraped_domains_lock:
-                            if (current_top_level_domain and 
-                                current_domain == current_top_level_domain and 
-                                current_top_level_domain not in self.scraped_domains):
-                                self.scraped_domains.add(current_top_level_domain)
-                                self._save_scraped_domain(current_top_level_domain)
-                                print(f"   ✅ Marked top-level domain {current_top_level_domain} as scraped")
+                        # Also add to top-level domains set if it's a top-level domain
+                        if is_top_level:
+                            with self.scraped_domains_lock:
+                                if current_top_level_domain not in self.scraped_domains:
+                                    self.scraped_domains.add(current_top_level_domain)
                         
                         soup = BeautifulSoup(response.content, 'html.parser')
                         links_found = self._extract_links(current_url, soup)
@@ -337,25 +345,25 @@ class GovMyCrawler:
         return None
 
     def crawl(self, crawl_limit=500, max_workers=50):
-        """Starts the crawling process with threading."""
+        """Starts the crawling process with threading using a stack (LIFO)."""
         if not self._initialize_queue():
             return
 
-        print(f"\n🚀 Starting recursive crawl with {max_workers} threads...")
+        print(f"\n🚀 Starting recursive crawl with {max_workers} threads using stack (depth-first)...")
         crawled_count = 0
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             while crawled_count < crawl_limit:
                 # Get URLs to process in this batch
                 urls_to_process = []
-                with self.queue_lock:
-                    batch_size = min(max_workers, crawl_limit - crawled_count, len(self.queue))
+                with self.stack_lock:
+                    batch_size = min(max_workers, crawl_limit - crawled_count, len(self.stack))
                     if batch_size == 0:
                         break
                     
                     for _ in range(batch_size):
-                        if self.queue:
-                            urls_to_process.append(self.queue.popleft())
+                        if self.stack:
+                            urls_to_process.append(self.stack.pop())  # LIFO - pop from end
                         else:
                             break
 
